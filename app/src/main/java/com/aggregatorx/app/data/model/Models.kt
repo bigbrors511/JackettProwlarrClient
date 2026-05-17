@@ -26,7 +26,20 @@ data class Provider(
     val avgResponseTime: Long = 0L,
     val successRate: Float = 1.0f,
     val totalSearches: Int = 0,
-    val failedSearches: Int = 0
+    val failedSearches: Int = 0,
+    
+    // WebView & JavaScript Support
+    val requiresJavaScript: Boolean = false,
+    val detectedFramework: String? = null, // React, Vue, Angular, etc.
+    val jsRenderTimeout: Long = 12000L, // 12 seconds default
+    val infiniteScrollEnabled: Boolean = false,
+    val searchPattern: String = "{baseUrl}/search?q={query}", // Search URL template
+    val searchFormSelector: String? = null, // CSS selector for search input
+    val submitButtonSelector: String? = null, // CSS selector for submit button
+    val resultItemSelector: String? = null, // CSS selector for result items
+    val webViewSuccessRate: Float = 0f,
+    val webViewAttempts: Int = 0,
+    val lastWebViewSearch: Long? = null
 )
 
 @Serializable
@@ -109,6 +122,12 @@ data class SiteAnalysis(
     val rateLimit: Int = 10, // requests per minute
     val retryCount: Int = 3,
     
+    // JavaScript & WebView
+    val detectedFramework: String? = null, // React, Vue, Angular, Next.js, etc.
+    val usesInfiniteScroll: Boolean = false,
+    val usesAjaxLoading: Boolean = false,
+    val recommendedWebViewTimeout: Long = 12000L,
+    
     // Raw data
     val rawHtml: String? = null,
     val headers: String = "{}", // JSON object
@@ -118,7 +137,7 @@ data class SiteAnalysis(
 @Serializable
 enum class ScrapingStrategy {
     HTML_PARSING,      // Simple Jsoup parsing
-    DYNAMIC_CONTENT,   // Requires JavaScript execution
+    DYNAMIC_CONTENT,   // Requires JavaScript execution via WebView
     API_BASED,         // Direct API calls
     HYBRID,            // Combination of methods
     HEADLESS_BROWSER,  // Full browser simulation
@@ -164,7 +183,8 @@ data class ProviderSearchResults(
     val errorMessage: String? = null,
     val totalResults: Int = results.size,
     val hasMore: Boolean = false,
-    val nextPageUrl: String? = null
+    val nextPageUrl: String? = null,
+    val usedWebView: Boolean = false
 )
 
 /**
