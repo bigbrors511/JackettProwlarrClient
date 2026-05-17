@@ -4,7 +4,7 @@ import android.webkit.WebResourceRequest
 import android.webkit.WebResourceResponse
 import android.webkit.WebView
 import android.webkit.WebViewClient
-import kotlinx.coroutines.CompletableFuture
+import java.util.concurrent.CompletableFuture
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withTimeout
 import kotlin.coroutines.resume
@@ -41,10 +41,9 @@ class JavaScriptWebViewEngine(private val webView: WebView) {
                 javaScriptEnabled = true
                 domStorageEnabled = true
                 databaseEnabled = true
+   
                 cacheMode = android.webkit.WebSettings.LOAD_DEFAULT
                 mixedContentMode = android.webkit.WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
-                // Allow JS to store data
-                setAppCacheEnabled(true)
                 javaScriptCanOpenWindowsAutomatically = true
             }
 
@@ -70,7 +69,7 @@ class JavaScriptWebViewEngine(private val webView: WebView) {
 
             // Inject JS interface for communication
             addJavascriptInterface(
-                JSInterface(this::onJSContentReady),
+                JSInterface { html -> onJSContentReady(html) },
                 "ContentExtractor"
             )
         }
@@ -88,7 +87,7 @@ class JavaScriptWebViewEngine(private val webView: WebView) {
                 return true;
             })();
             """.trimIndent()
-        ) { _ ->
+        ) { _: String? ->
             // Result handled in JS interface
         }
     }
@@ -158,7 +157,6 @@ class JavaScriptWebViewEngine(private val webView: WebView) {
                         window.ContentExtractor.onContentReady(html);
                     }
                 }, 500);
-
                 // Timeout after 14 seconds
                 setTimeout(() => {
                     clearInterval(waitForResults);
@@ -175,7 +173,7 @@ class JavaScriptWebViewEngine(private val webView: WebView) {
                 null
             }
 
-            webView.evaluateJavascript(js) { _ ->
+            webView.evaluateJavascript(js) { _: String? ->
                 // Result handled in JS interface
             }
         }
@@ -195,7 +193,7 @@ class JavaScriptWebViewEngine(private val webView: WebView) {
                     return JSON.stringify(links);
                 })();
                 """.trimIndent()
-            ) { result ->
+            ) { result: String? ->
                 try {
                     val json = result?.trim('"')?.replace("\\\"", "\"") ?: "[]"
                     val links = kotlinx.serialization.json.Json.decodeFromString<List<String>>(json)
@@ -215,7 +213,7 @@ class JavaScriptWebViewEngine(private val webView: WebView) {
             suspendCancellableCoroutine<Unit> { continuation ->
                 webView.evaluateJavascript(
                     "window.scrollBy(0, window.innerHeight); true;"
-                ) { _ ->
+                ) { _: String? ->
                     continuation.resume(Unit)
                 }
                 webView.postDelayed({ continuation.resume(Unit) }, 1500)
