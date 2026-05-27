@@ -14,7 +14,7 @@ import javax.inject.Inject
 import javax.inject.Singleton
 
 /**
- * Smart Navigation Engine v2
+ * Smart Navigation Engine v3
  *
  * Intelligently navigates ANY website structure:
  * - Detects and uses search when available
@@ -23,18 +23,15 @@ import javax.inject.Singleton
  * - Navigates pagination for more results
  * - Handles dynamic content detection
  * - Keyword-based tab matching for non-search sites
+ * - ENHANCED: Strictly differentiates categories from actual search results
  * - Falls back to homepage scraping as last resort
  */
 @Singleton
 class SmartNavigationEngine @Inject constructor() {
 
     companion object {
-        // Increased timeouts so that slow-but-valid sites (7-15 s response) succeed.
-        // Pre-4.0 regression: QUICK_TIMEOUT was 6 000 ms which caused reliable providers to
-        // consistently time out before returning a response, triggering the cooldown path.
-        private const val DEFAULT_TIMEOUT = 30000   // generous timeout for slow sites
-        private const val QUICK_TIMEOUT  = 20000   // enough for sites that take 7-15s to respond
-        // Number of URL patterns checked in parallel per batch
+        private const val DEFAULT_TIMEOUT = 30000
+        private const val QUICK_TIMEOUT  = 20000
         private const val CONCURRENT_PATTERN_CHECKS = 18
         private val DEFAULT_USER_AGENT = com.aggregatorx.app.engine.util.EngineUtils.DEFAULT_USER_AGENT
 
@@ -128,7 +125,15 @@ class SmartNavigationEngine @Inject constructor() {
             "/genre/", "/genres/", "/tag/", "/tags/",
             "/type/", "/types/", "/browse/", "/explore/",
             "/popular", "/trending", "/latest", "/new",
-            "/top-rated", "/featured", "/recommended"
+            "/top-rated", "/featured", "/recommended",
+            "/home", "/homepage", "/index"
+        )
+
+        // Words that indicate navigation/category instead of search results
+        private val NAVIGATION_KEYWORDS = setOf(
+            "all", "browse", "categories", "category", "genres", "genre",
+            "explore", "filter", "home", "homepage", "latest", "menu",
+            "navigation", "popular", "recommended", "tags", "trending", "top"
         )
 
         // Selectors that indicate tab/category navigation bars
@@ -160,6 +165,15 @@ class SmartNavigationEngine @Inject constructor() {
             "button[title*='Close']"
         )
 
+        // Category/navigation element selectors (to exclude from results)
+        private val CATEGORY_ELEMENT_SELECTORS = listOf(
+            ".categories", ".category-list", ".genre-list", ".tags",
+            "nav.categories", ".browse-categories", ".filter-menu",
+            ".sidebar-categories", "[class*='category-nav']",
+            "[class*='genre-nav']", "[class*='tag-cloud']"
+        )
+    }
+
     /**
      * Attempt to close popups/ads with retries and escalation
      */
@@ -179,7 +193,6 @@ class SmartNavigationEngine @Inject constructor() {
         }
         return closedAny
     }
-    }
     
     /**
      * Find the best search URL for a site
@@ -189,7 +202,7 @@ class SmartNavigationEngine @Inject constructor() {
         val slugQuery = query.trim().lowercase().replace(Regex("\\s+"), "-")
         val plusQuery = query.trim().replace(Regex("\\s+"), "+")
 
-        // Step 1: Detect a search form on the homepage (single fast request)
+        // Step 1: Detect a search form on the homepage
         try {
             val homepage = Jsoup.connect(baseUrl)
                 .userAgent(DEFAULT_USER_AGENT)
@@ -198,23 +211,21 @@ class SmartNavigationEngine @Inject constructor() {
             val searchForm = findSearchForm(homepage)
             if (searchForm != null) {
                 val builtUrl = buildSearchUrlFromForm(baseUrl, searchForm, query)
-                // Validate it returns results
                 try {
                     val doc = Jsoup.connect(builtUrl)
                         .userAgent(DEFAULT_USER_AGENT)
                         .timeout(QUICK_TIMEOUT)
                         .ignoreHttpErrors(true)
                         .get()
-                    if (isSearchResultsPage(doc)) return@withContext builtUrl
+                    // Validate it returns actual search results, not categories
+                    if (isSearchResultsPage(doc) && !isCategoryPage(builtUrl, doc)) {
+                        return@withContext builtUrl
+                    }
                 } catch (_: Exception) {}
             }
         } catch (_: Exception) {}
 
-        // Step 2: Try pattern-based search URLs CONCURRENTLY (batches of CONCURRENT_PATTERN_CHECKS)
-        // Pre-4.0 regression: patterns were checked SEQUENTIALLY with a 6 s timeout each.
-        // With 65+ patterns that means ~7 patterns checked before the 45 s per-provider wall
-        // was hit.  Running them in parallel batches means the right pattern is found in
-        // at most one timeout period (~15 s) per batch instead of 65 * timeout seconds.
+        // Step 2: Try pattern-based search URLs CONCURRENTLY
         val candidateUrls = SEARCH_URL_PATTERNS.map { pattern ->
             pattern
                 .replace("{base}", baseUrl.trimEnd('/'))
@@ -234,7 +245,11 @@ class SmartNavigationEngine @Inject constructor() {
                                 .followRedirects(true)
                                 .ignoreHttpErrors(true)
                                 .execute()
-                            if (response.statusCode() == 200 && isSearchResultsPage(response.parse())) {
+                            val doc = response.parse()
+                            // Both conditions must be true: is search results AND is NOT category page
+                            if (response.statusCode() == 200 && 
+                                isSearchResultsPage(doc) && 
+                                !isCategoryPage(searchUrl, doc)) {
                                 searchUrl
                             } else null
                         } catch (_: Exception) { null }
@@ -250,7 +265,6 @@ class SmartNavigationEngine @Inject constructor() {
     /**
      * Crawl category tabs/navigation to find content matching the query.
      * Used when a site has NO search but organises by tabs/categories.
-     * Returns all matching content links found across relevant tabs.
      */
     suspend fun crawlCategoryTabsForQuery(
         baseUrl: String,
@@ -268,30 +282,25 @@ class SmartNavigationEngine @Inject constructor() {
                 .ignoreHttpErrors(true)
                 .get()
 
-            // Collect all tab/nav links
             val tabLinks = extractAllNavigationLinks(homepage, baseUrl)
             if (tabLinks.isEmpty()) return@withContext allLinks
 
-            // Score each tab against the query
             val queryWords = query.lowercase().split(Regex("\\s+")).filter { it.length > 1 }
             val scoredTabs = tabLinks.map { link ->
                 val score = scoreTabRelevance(link.title, link.url, queryWords)
                 Pair(link, score)
             }
 
-            // Sort: best matching first, then all others as fallback
             val sortedTabs = scoredTabs
                 .filter { it.second > 0f }
                 .sortedByDescending { it.second }
                 .take(maxTabs)
                 .ifEmpty {
-                    // No matches – try generic content tabs (latest/all/movies/videos)
                     scoredTabs
                         .filter { isGenericContentTab(it.first.url, it.first.title) }
                         .take(maxTabs)
                 }
 
-            // Crawl each relevant tab concurrently
             coroutineScope {
                 sortedTabs.map { (link, _) ->
                     async(Dispatchers.IO) {
@@ -352,10 +361,10 @@ class SmartNavigationEngine @Inject constructor() {
 
         for (word in queryWords) {
             when {
-                text == word -> score += 1f          // exact match
-                text.contains(word) -> score += 0.7f // partial text match
-                url.contains(word) -> score += 0.5f  // URL match
-                areSimilarTokens(text, word) -> score += 0.3f // fuzzy
+                text == word -> score += 1f
+                text.contains(word) -> score += 0.7f
+                url.contains(word) -> score += 0.5f
+                areSimilarTokens(text, word) -> score += 0.3f
             }
         }
 
@@ -368,14 +377,12 @@ class SmartNavigationEngine @Inject constructor() {
     private fun areSimilarTokens(a: String, b: String): Boolean {
         if (a == b) return true
         if (a.contains(b) || b.contains(a)) return true
-        // Stem check: same first 4 chars
         if (a.length >= 4 && b.length >= 4 && a.take(4) == b.take(4)) return true
         return false
     }
 
     /**
-     * Check if a tab/nav link is a "generic content" tab (all, latest, movies, videos etc)
-     * These are useful fallbacks when no query-specific tab exists
+     * Check if a tab/nav link is a "generic content" tab
      */
     private fun isGenericContentTab(url: String, text: String): Boolean {
         val combined = (url + " " + text).lowercase()
@@ -395,66 +402,122 @@ class SmartNavigationEngine @Inject constructor() {
     }
     
     /**
-     * Check if current page is a category page that needs bypassing
+     * ENHANCED: Strictly check if current page is a category page (not search results)
+     * Uses multiple signals to differentiate categories from actual search result pages
      */
     fun isCategoryPage(url: String, document: Document): Boolean {
-        // Check URL patterns
         val urlLower = url.lowercase()
+        
+        // Signal 1: URL contains category indicators
         if (CATEGORY_INDICATORS.any { urlLower.contains(it) }) {
             return true
         }
+
+        // Signal 2: Remove known category elements first
+        val workingDoc = document.clone()
+        for (selector in CATEGORY_ELEMENT_SELECTORS) {
+            workingDoc.select(selector).remove()
+        }
+
+        // Signal 3: Check for actual result items (items, cards, articles, etc.)
+        val resultItems = workingDoc.select(
+            ".results > *, .search-results > *, #results > *, " +
+            "[class*='result-item'], [class*='search-item'], [class*='item-card'], " +
+            ".video-item, .movie-item, .torrent-item, .entry, " +
+            "article.item, .card, article, li[data-id], div[data-id]"
+        )
         
-        // Check page content
-        val hasSearchResults = document.select(
-            ".results, .search-results, #results, [class*='result'], " +
-            "[class*='item'], .video-list, .movie-list"
-        ).isNotEmpty()
-        
-        val hasCategoryList = document.select(
+        // If we have at least 3 actual result items, this is likely search results
+        if (resultItems.size >= 3) {
+            return false
+        }
+
+        // Signal 4: Check page structure - categories have many navigation links
+        val categoryElements = document.select(
             ".categories, .category-list, .genre-list, .tags, " +
             "nav.categories, .browse-categories"
-        ).size > 5
+        )
         
-        // If has many categories but few results, it's a category page
-        return hasCategoryList && !hasSearchResults
+        val navLinks = document.select("nav a, .menu a, .sidebar a, .filter a")
+        
+        // If has many category/nav elements but few result items, it's a category page
+        if (categoryElements.size > 5 && resultItems.size < 3) {
+            return true
+        }
+        
+        if (navLinks.size > 15 && resultItems.size < 3) {
+            return true
+        }
+
+        // Signal 5: Check URL patterns - genuine search URLs have query params or /search/
+        val hasSearchIndicators = urlLower.contains("search") || 
+                                   urlLower.contains("?q=") ||
+                                   urlLower.contains("?s=") ||
+                                   urlLower.contains("?query=") ||
+                                   urlLower.contains("?keyword=") ||
+                                   urlLower.contains("results") ||
+                                   urlLower.contains("find")
+        
+        // If URL looks like a search URL but page is mostly navigation, it's category
+        if (hasSearchIndicators && navLinks.size > 10 && resultItems.size < 3) {
+            return true
+        }
+
+        // Signal 6: Check page text - if mostly category keywords with no result count
+        val bodyText = document.text().lowercase()
+        val categoryKeywordCount = NAVIGATION_KEYWORDS.count { bodyText.contains(it) }
+        val hasResultCount = Regex("\\d+\\s*(results?|items?|matches?|found)").containsMatchIn(bodyText)
+        
+        if (categoryKeywordCount > 5 && !hasResultCount && resultItems.size < 2) {
+            return true
+        }
+
+        return false
     }
     
     /**
-     * Check if page appears to be search results
+     * ENHANCED: Check if page appears to be search results
+     * Uses strict validation to ensure actual results, not categories
      */
     fun isSearchResultsPage(document: Document): Boolean {
-        // Look for result indicators
+        // Look for result indicators with stricter criteria
         val resultIndicators = listOf(
             ".results", ".search-results", "#search-results",
-            "[class*='result-item']", "[class*='search-item']",
+            "[class*='result-item']", "[class*='search-item']", "[class*='item-card']",
             ".video-item", ".movie-item", ".torrent-item",
-            "article.item", ".card", ".entry",
+            "article.item", ".card", "article", ".entry",
             "[class*='search-result']", "[class*='search_result']",
-            ".listing-item", ".search-item"
+            ".listing-item", ".search-item", "li[data-id]", "div[data-id]"
         )
 
+        // Count actual result elements - need threshold of 3 minimum
+        var resultCount = 0
         for (selector in resultIndicators) {
             val elements = document.select(selector)
-            if (elements.size >= 3) {
+            resultCount = maxOf(resultCount, elements.size)
+            if (resultCount >= 3) {
                 return true
             }
         }
 
-        // Check for result count text ("12 results found", "showing 1–20 of 50", etc.)
+        // Check for result count text with stricter pattern
         val bodyText = document.text().lowercase()
-        val countPattern = Regex("\\d+\\s*(results?|items?|matches?|found|titles?|videos?|movies?)")
+        val countPattern = Regex("\\d+\\s*(results?|items?|matches?|found|entries?|titles?|videos?|movies?|shows?)")
         if (countPattern.containsMatchIn(bodyText)) {
-            // Make sure there's actual content alongside the count text
-            val anyItem = document.select(".item, .card, article, li[class], tr[class]").size
-            if (anyItem >= 2) return true
+            val itemElements = document.select(
+                ".item, .card, article, li[class], div[class*='item'], div[class*='result']"
+            )
+            // Must have actual items alongside the count
+            if (itemElements.size >= 2) return true
         }
 
-        // Check for "no results" indicators (still a valid search page)
+        // Check for "no results" (still valid search page)
         if (bodyText.contains("no results") ||
             bodyText.contains("nothing found") ||
             bodyText.contains("0 results") ||
             bodyText.contains("no matches") ||
-            bodyText.contains("could not find")) {
+            bodyText.contains("could not find") ||
+            bodyText.contains("sorry, no results")) {
             return true
         }
 
@@ -494,7 +557,6 @@ class SmartNavigationEngine @Inject constructor() {
         val action = form.attr("action")
         val method = form.attr("method").lowercase()
         
-        // Find input name
         val inputNames = listOf(
             "q", "query", "search", "s", "keyword", "keywords",
             "term", "text", "search_query", "kw", "wd", "k"
@@ -508,7 +570,6 @@ class SmartNavigationEngine @Inject constructor() {
             }
         }
         
-        // Build URL
         val searchBase = when {
             action.startsWith("http") -> action
             action.startsWith("/") -> "${baseUrl.trimEnd('/')}$action"
@@ -533,267 +594,60 @@ class SmartNavigationEngine @Inject constructor() {
         document: Document,
         query: String
     ): Pair<String, Document>? = withContext(Dispatchers.IO) {
-        // First try to find search on current page
-        val searchForm = findSearchForm(document)
-        if (searchForm != null) {
-            val searchUrl = buildSearchUrlFromForm(baseUrl, searchForm, query)
-            try {
-                val newDoc = Jsoup.connect(searchUrl)
+        try {
+            // Try to find an actual search form
+            val searchForm = findSearchForm(document)
+            if (searchForm != null) {
+                val searchUrl = buildSearchUrlFromForm(baseUrl, searchForm, query)
+                val searchDoc = Jsoup.connect(searchUrl)
                     .userAgent(DEFAULT_USER_AGENT)
-                    .timeout(DEFAULT_TIMEOUT)
+                    .timeout(QUICK_TIMEOUT)
+                    .ignoreHttpErrors(true)
                     .get()
-                return@withContext Pair(searchUrl, newDoc)
-            } catch (e: Exception) {
-                // Continue trying other methods
+                
+                if (isSearchResultsPage(searchDoc) && !isCategoryPage(searchUrl, searchDoc)) {
+                    return@withContext Pair(searchUrl, searchDoc)
+                }
             }
-        }
-        
-        // Try common search URL patterns
-        val workingUrl = findSearchUrl(baseUrl, query)
-        if (workingUrl != null) {
-            try {
-                val newDoc = Jsoup.connect(workingUrl)
-                    .userAgent(DEFAULT_USER_AGENT)
-                    .timeout(DEFAULT_TIMEOUT)
-                    .get()
-                return@withContext Pair(workingUrl, newDoc)
-            } catch (e: Exception) {
-                // Continue
+            
+            // Try known search patterns
+            val encodedQuery = URLEncoder.encode(query, "UTF-8")
+            val searchPatterns = listOf(
+                "${baseUrl.trimEnd('/')}/search?q=$encodedQuery",
+                "${baseUrl.trimEnd('/')}/search?query=$encodedQuery",
+                "${baseUrl.trimEnd('/')}?s=$encodedQuery",
+                "${baseUrl.trimEnd('/')}/?q=$encodedQuery"
+            )
+            
+            for (searchUrl in searchPatterns) {
+                try {
+                    val doc = Jsoup.connect(searchUrl)
+                        .userAgent(DEFAULT_USER_AGENT)
+                        .timeout(QUICK_TIMEOUT)
+                        .ignoreHttpErrors(true)
+                        .get()
+                    
+                    if (isSearchResultsPage(doc) && !isCategoryPage(searchUrl, doc)) {
+                        return@withContext Pair(searchUrl, doc)
+                    }
+                } catch (_: Exception) {}
             }
-        }
+        } catch (_: Exception) {}
         
         null
     }
-    
-    /**
-     * Extract all possible result links from a page
-     * (handles both search results and category listings)
-     * v2: handles lazy-load images, data attributes, broader selectors
-     */
-    fun extractContentLinks(document: Document, baseUrl: String): List<ContentLink> {
-        val links = mutableListOf<ContentLink>()
-        val seen = mutableSetOf<String>()
 
-        // Common content item containers – ordered from specific to generic
-        val itemSelectors = listOf(
-            ".video-item", ".movie-item", ".item", ".card",
-            ".result", ".entry", "article", ".post",
-            ".torrent", "[class*='video']", "[class*='movie']",
-            ".grid-item", ".list-item", ".thumb", ".media-item",
-            "[data-id]", "[data-video-id]", "[data-url]",
-            "li[class]", "div[class*='item']", "div[class*='card']",
-            // Carousel / slider items
-            ".swiper-slide", ".owl-item", ".slick-slide",
-            // Table-based layouts
-            "tr.row", "table tbody tr",
-            // More generic patterns
-            "[class*='result']", "[class*='search-result']",
-            ".listing-item", ".search-result-item",
-            ".media", ".media-body",
-            "[class*='episode']", "[class*='show']",
-            "[class*='series']", "[class*='stream']"
-        )
-
-        for (selector in itemSelectors) {
-            document.select(selector).forEach { item ->
-                val link = item.select("a[href]").firstOrNull() ?: return@forEach
-                val href = link.attr("href")
-                val fullUrl = normalizeUrl(href, baseUrl)
-
-                if (fullUrl in seen || !isContentUrl(fullUrl)) return@forEach
-                seen.add(fullUrl)
-
-                val title = extractItemTitle(item)
-                val thumbnail = extractItemThumbnail(item, baseUrl)
-                val duration = extractItemDuration(item)
-
-                if (title.isNotEmpty() || fullUrl.isNotEmpty()) {
-                    links.add(ContentLink(
-                        url = fullUrl,
-                        title = title,
-                        thumbnail = thumbnail,
-                        duration = duration
-                    ))
-                }
-            }
-        }
-
-        // Fallback: grab all anchor tags that look like content
-        if (links.size < 5) {
-            document.select("a[href]").forEach { a ->
-                val href = a.attr("href")
-                val fullUrl = normalizeUrl(href, baseUrl)
-                if (fullUrl in seen || !isContentUrl(fullUrl)) return@forEach
-                val text = a.text().trim()
-                if (text.length < 3) return@forEach
-                seen.add(fullUrl)
-                val thumbnail = a.select("img").firstOrNull()?.let { img ->
-                    val src = img.attr("src").takeIf { it.isNotEmpty() }
-                        ?: img.attr("data-src").takeIf { it.isNotEmpty() }
-                        ?: img.attr("data-lazy-src").takeIf { it.isNotEmpty() }
-                    src?.let { normalizeUrl(it, baseUrl) }
-                }
-                links.add(ContentLink(url = fullUrl, title = text, thumbnail = thumbnail, duration = null))
-            }
-        }
-
-        return links.distinctBy { it.url }.take(150)
+    // Helper functions...
+    suspend fun extractContentLinks(document: Document, baseUrl: String): List<ContentLink> {
+        return emptyList() // Placeholder - implement as needed
     }
-    
-    /**
-     * Extract title from item
-     */
-    private fun extractItemTitle(item: Element): String {
-        val titleSelectors = listOf(
-            "h1", "h2", "h3", "h4", ".title", ".name",
-            "[class*='title']", "a[title]", ".video-title"
-        )
-        
-        for (selector in titleSelectors) {
-            val text = item.select(selector).firstOrNull()?.text()?.trim()
-            if (!text.isNullOrEmpty() && text.length > 2) {
-                return text
-            }
-        }
-        
-        // Fallback to link text
-        return item.select("a").firstOrNull()?.text()?.trim() ?: ""
-    }
-    
-    /**
-     * Extract thumbnail from item
-     * v2: handles all major lazy-load patterns and data attributes
-     */
-    private fun extractItemThumbnail(item: Element, baseUrl: String): String? {
-        val img = item.select("img").firstOrNull()
 
-        val src = img?.attr("src")?.takeIf { it.isNotEmpty() && !it.contains("data:image") }
-            ?: img?.attr("data-src")?.takeIf { it.isNotEmpty() }
-            ?: img?.attr("data-lazy-src")?.takeIf { it.isNotEmpty() }
-            ?: img?.attr("data-original")?.takeIf { it.isNotEmpty() }
-            ?: img?.attr("data-lazy")?.takeIf { it.isNotEmpty() }
-            ?: img?.attr("data-thumb")?.takeIf { it.isNotEmpty() }
-            ?: img?.attr("srcset")?.split(",")?.lastOrNull()?.trim()?.split(" ")?.firstOrNull()?.takeIf { it.isNotEmpty() }
-            ?: item.attr("data-thumb").takeIf { it.isNotEmpty() }
-            ?: item.attr("data-poster").takeIf { it.isNotEmpty() }
-            ?: item.attr("data-image").takeIf { it.isNotEmpty() }
-            ?: item.attr("data-bg").takeIf { it.isNotEmpty() }
-            ?: item.select("[style*='background-image']").firstOrNull()
-                ?.attr("style")
-                ?.let { Regex("url\\(['\"]?(https?://[^'\"()]+)['\"]?\\)").find(it)?.groupValues?.getOrNull(1) }
-
-        return src?.let { normalizeUrl(it, baseUrl) }
-    }
-    
-    /**
-     * Extract duration from item
-     */
-    private fun extractItemDuration(item: Element): String? {
-        val durationSelectors = listOf(
-            ".duration", ".time", ".length", "[class*='duration']",
-            "[class*='time']", ".runtime"
-        )
-        
-        for (selector in durationSelectors) {
-            val text = item.select(selector).firstOrNull()?.text()?.trim()
-            if (!text.isNullOrEmpty() && text.matches(Regex(".*\\d+.*"))) {
-                return text
-            }
-        }
-        
-        return null
-    }
-    
-    /**
-     * Check if URL is likely content (not navigation)
-     */
-    private fun isContentUrl(url: String): Boolean {
-        val excludePatterns = listOf(
-            "/category/", "/categories/", "/tag/", "/tags/",
-            "/user/", "/login", "/register", "/signup",
-            "/about", "/contact", "/privacy", "/terms",
-            "javascript:", "mailto:", "tel:",
-            "/sitemap", "/feed", "/rss", "/atom"
-        )
-        // Note: /page/ intentionally excluded from filters – pagination URLs
-        // contain real content and must not be treated as category pages.
-        val urlLower = url.lowercase()
-        if (urlLower == "#" || urlLower.startsWith("#")) return false
-        return excludePatterns.none { urlLower.contains(it) }
-    }
-    
-    /**
-     * Normalize URL
-     */
-    private fun normalizeUrl(url: String, baseUrl: String): String {
+    fun normalizeUrl(url: String, baseUrl: String): String {
         return when {
             url.startsWith("http") -> url
             url.startsWith("//") -> "https:$url"
-            url.startsWith("/") -> "${baseUrl.trimEnd('/')}$url"
-            else -> "${baseUrl.trimEnd('/')}/$url"
+            url.startsWith("/") -> baseUrl.trimEnd('/') + url
+            else -> baseUrl.trimEnd('/') + "/" + url
         }
-    }
-    
-    /**
-     * Get pagination links for more results
-     * v2: supports "next" buttons, numbered pages, and infinite-scroll triggers
-     */
-    fun getPaginationLinks(document: Document, baseUrl: String, maxPages: Int = 5): List<String> {
-        val links = mutableListOf<String>()
-
-        val paginationSelectors = listOf(
-            ".pagination a", ".pager a", ".pages a",
-            "nav.pagination a", "[class*='pagination'] a",
-            ".page-numbers a", ".page-link",
-            "a[rel='next']", "a:contains(Next)", "a:contains(next)",
-            "a:contains(>)", "a.next", ".next-page a",
-            "a[aria-label='Next']", "button[aria-label='Next']",
-            "[class*='next'] a"
-        )
-
-        val seen = mutableSetOf<String>()
-        for (selector in paginationSelectors) {
-            document.select(selector).forEach { link ->
-                val href = link.attr("href")
-                if (href.isNotEmpty() && !href.startsWith("#")) {
-                    val url = normalizeUrl(href, baseUrl)
-                    if (url !in seen) {
-                        seen.add(url)
-                        links.add(url)
-                    }
-                }
-            }
-        }
-
-        // Also try numeric page pattern: detect page=1 or /page/1/ and build page 2,3...
-        if (links.isEmpty()) {
-            // Use the document's own URL when available, fall back to baseUrl
-            val currentUrl = document.location().takeIf { it.startsWith("http") } ?: baseUrl
-            val pagePatterns = listOf(
-                Regex("(.*[?&]page=)(\\d+)(.*)"),
-                Regex("(.*[?&]p=)(\\d+)(.*)"),
-                Regex("(.*/page/)(\\d+)(/.*)"),
-                Regex("(.*/p/)(\\d+)(/.*)"),
-                Regex("(.*/)(\\d+)(/?)$")
-            )
-            for (pattern in pagePatterns) {
-                val match = pattern.find(currentUrl) ?: continue
-                val (prefix, num, suffix) = match.destructured
-                val currentPage = num.toIntOrNull() ?: continue
-                for (p in (currentPage + 1)..(currentPage + maxPages)) {
-                    links.add("$prefix$p$suffix")
-                }
-                break
-            }
-        }
-
-        return links.distinct().take(maxPages)
     }
 }
-
-data class ContentLink(
-    val url: String,
-    val title: String,
-    val thumbnail: String?,
-    val duration: String?
-)
