@@ -17,7 +17,17 @@ object WebViewFetcher {
     ): String? = withContext(Dispatchers.Main) {
         var webView: WebView? = null
         return@withContext try {
-            webView = WebView(android.app.ActivityThread.currentApplication())
+            // Use application context safely
+            val context = try {
+                android.app.ActivityThread.currentApplication()
+            } catch (_: Exception) {
+                // Fallback if ActivityThread not available
+                null
+            }
+            
+            if (context == null) return@withContext null
+            
+            webView = WebView(context)
             
             webView.settings.apply {
                 javaScriptEnabled = true
