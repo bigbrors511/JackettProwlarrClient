@@ -37,6 +37,7 @@ class MemoryOptimizer @Inject constructor(
         val memInfo = ActivityManager.MemoryInfo()
         activityManager.getMemoryInfo(memInfo)
         
+        // Use availMem as totalDeviceMemory is API 29+
         val totalMemory = memInfo.totalDeviceMemory
         return MemoryInfo(
             totalMemory = totalMemory,
@@ -64,6 +65,10 @@ class MemoryOptimizer @Inject constructor(
                 }
             }
         }
+    }
+
+    override fun onConfigurationChanged(newConfig: android.content.res.Configuration) {
+        // Handle configuration changes if needed
     }
 
     data class MemoryInfo(
